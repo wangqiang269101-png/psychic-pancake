@@ -1,0 +1,7 @@
+{"ts": "2026-06-24T09:17:44", "event": "rendered", "image": "/Users/wangyongqiang/Desktop/codex/profit-cloud-deploy/local_push/outputs/每日利润播报-2026-06-23.jpg", "date": "2026-06-23"}
+{"ts": "2026-06-24T09:17:44", "event": "dry_run_ok", "message": "/Users/wangyongqiang/Desktop/codex/profit-cloud-deploy/local_push/outputs/message-2026-06-23.md", "image": "/Users/wangyongqiang/Desktop/codex/profit-cloud-deploy/local_push/outputs/每日利润播报-2026-06-23.jpg"}
+{"ts": "2026-06-24T09:20:41", "event": "rendered", "image": "/Users/wangyongqiang/Desktop/codex/profit-cloud-deploy/local_push/outputs/每日利润播报-2026-06-23.jpg", "date": "2026-06-23"}
+{"ts": "2026-06-24T09:20:41", "event": "dry_run_ok", "message": "/Users/wangyongqiang/Desktop/codex/profit-cloud-deploy/local_push/outputs/message-2026-06-23.md", "image": "/Users/wangyongqiang/Desktop/codex/profit-cloud-deploy/local_push/outputs/每日利润播报-2026-06-23.jpg"}
+{"ts": "2026-06-24T09:22:09", "event": "skip", "reason": "数据文件不存在：data/latest-profit-payload.json"}
+{"ts": "2026-06-24T09:23:08", "event": "rendered", "image": "/Users/wangyongqiang/Desktop/codex/profit-cloud-deploy/local_push/outputs/每日利润播报-2026-06-23.jpg", "date": "2026-06-23"}
+{"ts": "2026-06-24T09:23:08", "event": "dry_run_ok", "message": "/Users/wangyongqiang/Desktop/codex/profit-cloud-deploy/local_push/outputs/message-2026-06-23.md", "image": "/Users/wangyongqiang/Desktop/codex/profit-cloud-deploy/local_push/outputs/每日利润播报-2026-06-23.jpg"}

@@ -1,0 +1,7 @@
+{
+  "data_path": "data/latest-profit-payload.json",
+  "not_before": "08:00",
+  "allowed_data_lag_days": 1,
+  "template_image": "/Users/wangyongqiang/Library/Containers/com.tencent.WeWorkMac/Data/tmp/wecom-temp-209980-ed3f71a0564cd5b7681eaff2063156a9.jpg",
+  "wecom_webhook": ""
+}

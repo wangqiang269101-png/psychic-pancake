@@ -1,0 +1,91 @@
+name: Daily Profit Push
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      source_mode:
+        description: "auto/http_json/powerbi_scrape/sample"
+        required: false
+        default: "http_json"
+      dry_run:
+        description: "Run without sending WeCom messages"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  push-profit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    env:
+      TZ: Asia/Shanghai
+      WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+      PROFIT_DATA_JSON_URL: ${{ secrets.PROFIT_DATA_JSON_URL }}
+      PROFIT_DATA_JSON_HEADERS: ${{ secrets.PROFIT_DATA_JSON_HEADERS }}
+      POWERBI_REPORT_URL: ${{ vars.POWERBI_REPORT_URL }}
+      TARGET_DATA_LAG_DAYS: ${{ vars.TARGET_DATA_LAG_DAYS || '2' }}
+      MAX_DATA_LAG_DAYS: ${{ vars.MAX_DATA_LAG_DAYS || '2' }}
+      WECOM_MAX_ATTEMPTS: ${{ vars.WECOM_MAX_ATTEMPTS || '4' }}
+      WECOM_TIMEOUT_SECONDS: ${{ vars.WECOM_TIMEOUT_SECONDS || '30' }}
+      WECOM_RETRY_BASE_SECONDS: ${{ vars.WECOM_RETRY_BASE_SECONDS || '1.5' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r cloud_push/requirements.txt
+
+      - name: Restore push state cache
+        id: state-cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: cloud_push/.state
+          key: profit-push-state-${{ github.run_id }}
+          restore-keys: |
+            profit-push-state-
+
+      - name: Run cloud push
+        run: |
+          set -euo pipefail
+          SOURCE_MODE="${{ github.event.inputs.source_mode }}"
+          if [ -z "${SOURCE_MODE}" ]; then
+            SOURCE_MODE="http_json"
+          fi
+          DRY_ARG=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            DRY_ARG="--dry-run"
+          fi
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            DRY_ARG=""
+          fi
+          echo "run source mode: ${SOURCE_MODE}"
+          python cloud_push/profit_cloud_push.py --source "${SOURCE_MODE}" ${DRY_ARG}
+
+      - name: Save push state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: cloud_push/.state
+          key: profit-push-state-${{ github.run_id }}
+
+      - name: Upload render artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: profit-push-artifacts-${{ github.run_id }}
+          path: |
+            cloud_push/outputs/*.png
+            cloud_push/outputs/*.md
+            cloud_push/.state/state.json
+          if-no-files-found: ignore

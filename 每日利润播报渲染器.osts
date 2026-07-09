@@ -1,0 +1,176 @@
+interface ProfitRow {
+  类型?: string;
+  区域?: string;
+  日期?: string;
+  当日总利润?: number;
+  当日外卖利润?: number;
+  当日团购利润?: number;
+  月累计总利润?: number;
+  月累计外卖利润?: number;
+  月累计团购利润?: number;
+  本月预计总利润?: number;
+  本月预计外卖利润?: number;
+  本月预计团购利润?: number;
+}
+
+interface RenderResult {
+  imageBase64: string;
+  md5: string;
+  messageText: string;
+}
+
+function main(workbook: ExcelScript.Workbook, payloadJson: string): RenderResult {
+  const worksheet = workbook.getWorksheet("日报图片");
+  const parsed = JSON.parse(payloadJson) as ProfitRow[];
+  const company = parsed.find((row) => row.类型 === "公司");
+  const regions = parsed
+    .filter((row) => row.类型 === "区域" && row.区域)
+    .sort((a, b) => (b.当日总利润 ?? 0) - (a.当日总利润 ?? 0))
+    .slice(0, 9);
+
+  if (!company) {
+    throw new Error("未找到公司汇总数据。");
+  }
+
+  const date = new Date(company.日期 ?? "");
+  const dateText = [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("-");
+
+  worksheet.getRange("L2").setValue(dateText);
+  worksheet.getRange("A9").setValue(`${fmt(company.月累计总利润)} 万元\n累计权责总利润`);
+  worksheet.getRange("I8").setValue(`累计外卖利润\n${fmt(company.月累计外卖利润)} 万元`);
+  worksheet.getRange("I12").setValue(`累计团购利润\n${fmt(company.月累计团购利润)} 万元`);
+  worksheet.getRange("A20").setValue(`${fmt(company.当日总利润)}\n万元`);
+  worksheet.getRange("F20").setValue(`${fmt(company.当日外卖利润)}\n万元`);
+  worksheet.getRange("K20").setValue(`${fmt(company.当日团购利润)}\n万元`);
+
+  for (let i = 0; i < 9; i += 1) {
+    const rowNumber = 28 + i * 2;
+    const row = regions[i];
+    worksheet.getRange(`A${rowNumber}`).setValue(i + 1);
+    worksheet.getRange(`B${rowNumber}`).setValue(row?.区域 ?? "-");
+    worksheet.getRange(`G${rowNumber}`).setValue(row ? round2(row.当日总利润) : "");
+    worksheet.getRange(`J${rowNumber}`).setValue(row ? round2(row.当日外卖利润) : "");
+    worksheet.getRange(`M${rowNumber}`).setValue(row ? round2(row.当日团购利润) : "");
+  }
+
+  const imageBase64 = worksheet.getRange("A1:O48").getImage();
+  const md5 = md5Base64(imageBase64);
+  const messageText = [
+    `📊 每日利润播报｜${dateText}`,
+    "",
+    "🔥 当日利润",
+    `• 权责总利润：${fmt(company.当日总利润)} 万元`,
+    `• 外卖利润：${fmt(company.当日外卖利润)} 万元`,
+    `• 团购利润：${fmt(company.当日团购利润)} 万元`,
+    "",
+    "📅 本月累计",
+    `• 累计权责总利润：${fmt(company.月累计总利润)} 万元`,
+    `• 累计外卖利润：${fmt(company.月累计外卖利润)} 万元`,
+    `• 累计团购利润：${fmt(company.月累计团购利润)} 万元`,
+    "",
+    "🎯 本月预计",
+    `• 本月预计累计权责总利润：${fmt(company.本月预计总利润)} 万元`,
+    `• 累计预计权责外卖利润：${fmt(company.本月预计外卖利润)} 万元`,
+    `• 累计预计团购利润：${fmt(company.本月预计团购利润)} 万元`,
+  ].join("\n");
+
+  return { imageBase64, md5, messageText };
+}
+
+function round2(value: number | undefined): number | string {
+  if (value === undefined || value === null) return "";
+  return Math.round(value * 100) / 100;
+}
+
+function fmt(value: number | undefined): string {
+  if (value === undefined || value === null) return "-";
+  return (Math.round(value * 100) / 100).toFixed(2);
+}
+
+function md5Base64(base64: string): string {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const clean = base64.replace(/[^A-Za-z0-9+/=]/g, "");
+  const bytes: number[] = [];
+  let index = 0;
+  while (index < clean.length) {
+    const e1 = chars.indexOf(clean.charAt(index++));
+    const e2 = chars.indexOf(clean.charAt(index++));
+    const e3c = clean.charAt(index++);
+    const e4c = clean.charAt(index++);
+    const e3 = e3c === "=" ? 64 : chars.indexOf(e3c);
+    const e4 = e4c === "=" ? 64 : chars.indexOf(e4c);
+    bytes.push((e1 << 2) | (e2 >> 4));
+    if (e3 !== 64) bytes.push(((e2 & 15) << 4) | (e3 >> 2));
+    if (e4 !== 64) bytes.push(((e3 & 3) << 6) | e4);
+  }
+  return md5Bytes(bytes);
+}
+
+function md5Bytes(input: number[]): string {
+  const originalLength = input.length;
+  const data = input.slice();
+  data.push(0x80);
+  while (data.length % 64 !== 56) data.push(0);
+  const bitLength = originalLength * 8;
+  for (let i = 0; i < 8; i += 1) data.push(Math.floor(bitLength / Math.pow(256, i)) & 0xff);
+
+  let a0 = 0x67452301;
+  let b0 = 0xefcdab89;
+  let c0 = 0x98badcfe;
+  let d0 = 0x10325476;
+  const shifts = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
+  const constants: number[] = [];
+  for (let i = 0; i < 64; i += 1) constants.push(Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296) >>> 0);
+
+  for (let offset = 0; offset < data.length; offset += 64) {
+    const words: number[] = [];
+    for (let i = 0; i < 16; i += 1) {
+      const p = offset + i * 4;
+      words.push((data[p] | (data[p + 1] << 8) | (data[p + 2] << 16) | (data[p + 3] << 24)) >>> 0);
+    }
+
+    let a = a0;
+    let b = b0;
+    let c = c0;
+    let d = d0;
+
+    for (let i = 0; i < 64; i += 1) {
+      let f: number;
+      let g: number;
+      if (i < 16) {
+        f = (b & c) | (~b & d);
+        g = i;
+      } else if (i < 32) {
+        f = (d & b) | (~d & c);
+        g = (5 * i + 1) % 16;
+      } else if (i < 48) {
+        f = b ^ c ^ d;
+        g = (3 * i + 5) % 16;
+      } else {
+        f = c ^ (b | ~d);
+        g = (7 * i) % 16;
+      }
+      const shift = shifts[Math.floor(i / 16) * 4 + (i % 4)];
+      const sum = (a + f + constants[i] + words[g]) >>> 0;
+      const rotated = ((sum << shift) | (sum >>> (32 - shift))) >>> 0;
+      const nextD = d;
+      d = c;
+      c = b;
+      b = (b + rotated) >>> 0;
+      a = nextD;
+    }
+
+    a0 = (a0 + a) >>> 0;
+    b0 = (b0 + b) >>> 0;
+    c0 = (c0 + c) >>> 0;
+    d0 = (d0 + d) >>> 0;
+  }
+
+  return [a0, b0, c0, d0]
+    .map((word) => [0, 8, 16, 24].map((shift) => ((word >>> shift) & 0xff).toString(16).padStart(2, "0")).join(""))
+    .join("");
+}
