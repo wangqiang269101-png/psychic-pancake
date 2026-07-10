@@ -8,7 +8,7 @@ on:
       source_mode:
         description: "auto/http_json/powerbi_scrape/sample"
         required: false
-        default: "http_json"
+        default: "auto"
       dry_run:
         description: "Run without sending WeCom messages"
         required: false
@@ -60,7 +60,11 @@ jobs:
           set -euo pipefail
           SOURCE_MODE="${{ github.event.inputs.source_mode }}"
           if [ -z "${SOURCE_MODE}" ]; then
-            SOURCE_MODE="http_json"
+            if [ "${{ github.event_name }}" = "schedule" ]; then
+              SOURCE_MODE="auto"
+            else
+              SOURCE_MODE="auto"
+            fi
           fi
           DRY_ARG=""
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.dry_run }}" = "true" ]; then

@@ -1,7 +1,7 @@
 #!/bin/zsh
 set -euo pipefail
 
-SRC_ROOT="/Users/wangyongqiang/Desktop/codex/profit-cloud-deploy/local_push"
+SRC_ROOT="/Users/wangyongqiang/Desktop/Ai 助手/profit-cloud-deploy/local_push"
 ROOT="$HOME/Library/Application Support/profit-push"
 LABEL="com.wangyongqiang.daily-profit-push"
 PLIST_SRC="$SRC_ROOT/$LABEL.plist"
