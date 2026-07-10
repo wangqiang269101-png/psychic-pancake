@@ -54,10 +54,64 @@ def load_browser_cookies() -> list[dict[str, str]]:
 
 
 def parse_aria_number(label: str, marker: str) -> float:
-    match = re.search(rf"{re.escape(marker)}\s*(-?\d+(?:\.\d+)?)", label)
+    match = re.search(rf"{re.escape(marker)}\s*[:：]?\s*(-?\d+(?:\.\d+)?)", label)
     if not match:
         raise ValueError(f"无法从 aria-label 解析 {marker}: {label}")
     return float(match.group(1))
+
+
+def parse_aria_text(label: str, marker: str, following_markers: tuple[str, ...]) -> str | None:
+    following = "|".join(re.escape(item) for item in following_markers)
+    match = re.search(
+        rf"{re.escape(marker)}\s*[:：]?\s*(.+?)(?=\s*(?:{following})\s*[:：]?|[,，;；]|$)",
+        label,
+    )
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def parse_city_aria_rows(labels: list[str]) -> list[dict[str, Any]]:
+    """Parse city table rows when Power BI exposes them as one aria label per row."""
+    cities: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    city_markers = ("外卖城市", "城市名称", "城市")
+    total_markers = ("权责总利润(万)", "当日总利润", "权责总利润")
+    delivery_markers = ("权责外卖利润(万)", "当日外卖利润", "权责外卖利润")
+    group_markers = ("团购利润(万)", "当日团购利润", "团购利润")
+    all_following = ("区域名称", "区域", *total_markers, *delivery_markers, *group_markers)
+
+    for label in labels:
+        city_marker = next((marker for marker in city_markers if marker in label), None)
+        total_marker = next((marker for marker in total_markers if marker in label), None)
+        delivery_marker = next((marker for marker in delivery_markers if marker in label), None)
+        group_marker = next((marker for marker in group_markers if marker in label), None)
+        if not all((city_marker, total_marker, delivery_marker, group_marker)):
+            continue
+        city_name = parse_aria_text(label, city_marker, all_following)
+        if not city_name or city_name in {"城市", "城市名称", "外卖城市", "Total"}:
+            continue
+        region_marker = next((marker for marker in ("区域名称", "区域") if marker in label), None)
+        region_name = (
+            parse_aria_text(label, region_marker, (*total_markers, *delivery_markers, *group_markers))
+            if region_marker
+            else ""
+        )
+        key = (city_name, region_name or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        cities.append(
+            {
+                "类型": "城市",
+                "城市": city_name,
+                "区域": region_name or "",
+                "当日总利润": parse_aria_number(label, total_marker),
+                "当日外卖利润": parse_aria_number(label, delivery_marker),
+                "当日团购利润": parse_aria_number(label, group_marker),
+            }
+        )
+    return cities
 
 
 def parse_aria_date(label: str) -> str:
@@ -202,6 +256,7 @@ def scrape_powerbi_payload(report_url: str) -> list[dict[str, Any]]:
     lines = [line.strip() for line in body_text.splitlines()]
     month_total, month_delivery, month_group = parse_monthly_totals(lines)
     regions = parse_region_rows(lines)
+    cities = parse_city_aria_rows(aria_labels)
     if not regions:
         raise ValueError("未解析到区域利润明细。")
 
@@ -229,4 +284,5 @@ def scrape_powerbi_payload(report_url: str) -> list[dict[str, Any]]:
         }
     ]
     payload.extend(regions)
+    payload.extend(cities)
     return payload
