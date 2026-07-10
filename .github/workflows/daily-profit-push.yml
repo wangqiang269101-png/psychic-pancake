@@ -66,6 +66,10 @@ jobs:
               SOURCE_MODE="auto"
             fi
           fi
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "${SOURCE_MODE}" = "sample" ]; then
+            echo "schedule 禁止使用 sample 数据源"
+            exit 1
+          fi
           DRY_ARG=""
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             DRY_ARG="--dry-run"

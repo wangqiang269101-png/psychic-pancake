@@ -29,13 +29,17 @@ git push -u origin main
 
 echo "==> configure secrets/vars"
 "$GH" secret set WECOM_WEBHOOK --repo "$REPO" --body "$WECOM_WEBHOOK"
-if [[ -n "${PROFIT_DATA_JSON_URL:-}" ]]; then
-  "$GH" secret set PROFIT_DATA_JSON_URL --repo "$REPO" --body "$PROFIT_DATA_JSON_URL"
-fi
 if [[ -n "${PROFIT_DATA_JSON_HEADERS:-}" ]]; then
   "$GH" secret set PROFIT_DATA_JSON_HEADERS --repo "$REPO" --body "$PROFIT_DATA_JSON_HEADERS"
 fi
 "$GH" variable set POWERBI_REPORT_URL --repo "$REPO" --body "$POWERBI_URL"
+
+DEFAULT_JSON_URL="https://raw.githubusercontent.com/${REPO}/main/cloud_push/data/latest-profit-payload.json"
+if [[ -z "${PROFIT_DATA_JSON_URL:-}" ]]; then
+  PROFIT_DATA_JSON_URL="$DEFAULT_JSON_URL"
+  echo "未显式提供 PROFIT_DATA_JSON_URL，使用仓库 raw JSON: $PROFIT_DATA_JSON_URL"
+fi
+"$GH" secret set PROFIT_DATA_JSON_URL --repo "$REPO" --body "$PROFIT_DATA_JSON_URL"
 
 SOURCE_MODE="${SOURCE_MODE:-auto}"
 echo "==> workflow dry_run (${SOURCE_MODE})"

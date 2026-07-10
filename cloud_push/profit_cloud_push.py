@@ -679,6 +679,9 @@ def run() -> int:
     webhook = os.getenv("WECOM_WEBHOOK", "").strip()
 
     try:
+        if args.source == "sample" and not args.dry_run and not args.force:
+            raise RuntimeError("生产推送禁止使用 sample 数据源，请改用 auto/http_json/powerbi_scrape。")
+
         payload = fetch_payload(args.source, args.sample_file)
         report = normalize_profit_payload(payload)
         validate_profit_report(
