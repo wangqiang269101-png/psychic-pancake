@@ -93,6 +93,13 @@ def config_float(name: str, default: float) -> float:
     return float(raw)
 
 
+def config_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def load_state() -> dict:
     if STATE_PATH.exists():
         return json.loads(STATE_PATH.read_text(encoding="utf-8"))
@@ -414,6 +421,8 @@ def validate_profit_report(
         raise ValueError("利润字段存在空值或非数字。")
     if not report["regions"]:
         raise ValueError("未读取到区域利润数据。")
+    if config_bool("REQUIRE_CITY_DETAILS") and not report["city_details_available"]:
+        raise ValueError("未读取到城市下钻明细，禁止生成不完整的生产播报。")
 
     if enforce_date_guard:
         lag_days = (now.date() - report["date"].date()).days
@@ -454,20 +463,30 @@ def build_message_text(report: dict) -> str:
     )
 
 
-def pick_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    candidates = [
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+def pick_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
+    """Load a real CJK font; never silently fall back to Pillow's tiny bitmap font."""
+    regular = [
         "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
     ]
-    if bold:
-        candidates = [c.replace("Regular", "Bold") for c in candidates] + candidates
-    for path in candidates:
+    bold_candidates = [
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Bold.otf",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    ]
+    for path in (bold_candidates if bold else regular):
         try:
-            return ImageFont.truetype(path, size=size)
-        except Exception:
+            # PingFang collection index 0 is a complete Simplified Chinese face.
+            return ImageFont.truetype(path, size=size, index=0)
+        except (OSError, ValueError):
             continue
-    return ImageFont.load_default()
+    raise RuntimeError("未找到可用中文字体（PingFang / STHeiti / Noto Sans CJK / 文泉驿）。")
 
 
 def draw_text(draw: ImageDraw.ImageDraw, xy: tuple[int, int], text: str, size: int, color: str = "#111", bold: bool = False) -> None:
@@ -505,146 +524,117 @@ def signed_color(value: float, positive: str = "#1A7F37") -> str:
 
 
 def render_profit_image(report: dict) -> Path:
+    """Render a phone-first portrait report for WeCom."""
     c = report["company"]
     profit_rows = report.get("profit_regions") or []
     region_loss_rows = report.get("loss_regions") or []
     loss_rows = report.get("loss_cities") or []
-    detail_row_count = max(8, len(profit_rows), len(region_loss_rows), len(loss_rows))
-    panel_bottom = 720 + detail_row_count * 62
-    detail_bottom = panel_bottom + 28
-    image = Image.new("RGB", (1500, detail_bottom + 36), "#F4F6FA")
+
+    width, margin, gap = 1080, 40, 24
+    card_width = width - margin * 2
+    header_h, kpi_h = 168, 256
+    section_header_h, table_header_h, row_h = 86, 62, 70
+
+    def section_height(rows: list[dict], empty_rows: int = 1) -> int:
+        return section_header_h + table_header_h + max(len(rows), empty_rows) * row_h + 24
+
+    content_height = (
+        margin + header_h + gap
+        + 3 * (kpi_h + gap)
+        + section_height(profit_rows)
+        + gap + section_height(region_loss_rows)
+        + gap + section_height(loss_rows)
+        + margin
+    )
+    image = Image.new("RGB", (width, content_height), "#F3F6FA")
     draw = ImageDraw.Draw(image)
     colors = {
-        "surface": "#FFFFFF",
-        "border": "#DEE4EE",
-        "headline": "#0F172A",
-        "subtle": "#64748B",
-        "muted_bg": "#EFF3FA",
-        "primary": "#2A5BD7",
-        "growth": "#1B8F4B",
-        "risk": "#D14343",
-        "row_alt": "#F8FAFD",
+        "surface": "#FFFFFF", "border": "#DDE4EE", "headline": "#14213D",
+        "subtle": "#64748B", "primary": "#2463D4", "primary_bg": "#EAF1FF",
+        "growth": "#168447", "growth_bg": "#E9F7EF",
+        "risk": "#CE3D45", "risk_bg": "#FDEDEF", "row_alt": "#F8FAFD",
     }
 
-    page_left = 36
-    page_right = 1464
+    def card(y1: int, y2: int) -> None:
+        draw.rounded_rectangle(
+            (margin, y1, width - margin, y2), radius=24,
+            fill=colors["surface"], outline=colors["border"], width=2,
+        )
 
     # Header
-    draw.rounded_rectangle((page_left, 28, page_right, 152), radius=24, fill=colors["surface"], outline=colors["border"], width=2)
-    draw_text(draw, (68, 58), "每日利润播报", 44, colors["headline"], bold=True)
-    draw_text(draw, (68, 108), "利润业务经营看板（单位：万元）", 22, colors["subtle"])
-    draw.rounded_rectangle((1188, 58, 1432, 122), radius=16, fill=colors["muted_bg"])
-    draw_text(draw, (1220, 80), report["date_text"], 28, colors["primary"], bold=True)
+    y = margin
+    card(y, y + header_h)
+    draw_text(draw, (margin + 32, y + 28), "每日利润播报", 54, colors["headline"], bold=True)
+    draw_text(draw, (margin + 34, y + 101), "经营利润看板 · 单位：万元", 28, colors["subtle"])
+    draw.rounded_rectangle((width - margin - 310, y + 46, width - margin - 30, y + 112), radius=18, fill=colors["primary_bg"])
+    draw_text_right(draw, width - margin - 58, y + 60, report["date_text"], 32, colors["primary"], bold=True)
+    y += header_h + gap
 
-    # KPI cards
-    card_top = 180
-    card_height = 252
-    card_gap = 22
-    card_width = int((page_right - page_left - card_gap * 2) / 3)
+    # KPI cards form a vertical reading flow.
     blocks = [
         ("当日利润", c["daily_total"], c["daily_delivery"], c["daily_group"]),
         ("本月累计", c["month_total"], c["month_delivery"], c["month_group"]),
         ("本月预计", c["forecast_total"], c["forecast_delivery"], c["forecast_group"]),
     ]
-    for idx, (title, total, delivery, group) in enumerate(blocks):
-        x1 = page_left + idx * (card_width + card_gap)
-        x2 = x1 + card_width
-        draw.rounded_rectangle((x1, card_top, x2, card_top + card_height), radius=20, fill=colors["surface"], outline=colors["border"], width=2)
-        draw_text(draw, (x1 + 22, card_top + 22), title, 28, colors["headline"], bold=True)
-        draw_text(draw, (x1 + 22, card_top + 70), "权责总利润", 20, colors["subtle"])
-        draw_text_right(draw, x2 - 22, card_top + 66, f"{fmt(total)} 万元", 40, signed_color(total, colors["growth"]), bold=True)
-        draw.line((x1 + 20, card_top + 128, x2 - 20, card_top + 128), fill="#E8EDF5", width=2)
-        draw_text(draw, (x1 + 22, card_top + 150), "外卖利润", 20, colors["subtle"])
-        draw_text_right(draw, x2 - 22, card_top + 150, f"{fmt(delivery)} 万元", 24, signed_color(delivery, colors["growth"]), bold=True)
-        draw_text(draw, (x1 + 22, card_top + 194), "团购利润", 20, colors["subtle"])
-        draw_text_right(draw, x2 - 22, card_top + 194, f"{fmt(group)} 万元", 24, signed_color(group, colors["growth"]), bold=True)
+    for title, total, delivery, group in blocks:
+        card(y, y + kpi_h)
+        draw.rounded_rectangle((margin + 22, y + 22, margin + 214, y + 78), radius=14, fill=colors["primary_bg"])
+        draw_text(draw, (margin + 44, y + 33), title, 32, colors["primary"], bold=True)
+        draw_text(draw, (margin + 34, y + 103), "权责总利润", 32, colors["headline"], bold=True)
+        draw_text_right(draw, width - margin - 34, y + 91, f"{fmt(total)}", 48, signed_color(total, colors["growth"]), bold=True)
+        draw_text_right(draw, width - margin - 34, y + 143, "万元", 25, colors["subtle"])
+        draw.line((margin + 34, y + 178, width - margin - 34, y + 178), fill="#E8EDF4", width=2)
+        draw_text(draw, (margin + 34, y + 199), "外卖", 30, colors["subtle"])
+        draw_text(draw, (margin + 340, y + 199), "团购", 30, colors["subtle"])
+        draw_text_right(draw, margin + 310, y + 194, fmt(delivery), 36, signed_color(delivery, colors["growth"]), bold=True)
+        draw_text_right(draw, width - margin - 34, y + 194, fmt(group), 36, signed_color(group, colors["growth"]), bold=True)
+        y += kpi_h + gap
 
-    # Detail section
-    detail_top = 458
-    draw.rounded_rectangle(
-        (page_left, detail_top, page_right, detail_bottom),
-        radius=20,
-        fill=colors["surface"],
-        outline=colors["border"],
-        width=2,
-    )
-    draw_text(draw, (66, 488), "区域盈亏与亏损城市明细", 32, colors["headline"], bold=True)
-    draw_text(draw, (66, 530), "亏损仅指当日利润小于 0，不代表环比下滑", 20, colors["subtle"])
+    def draw_section(title: str, rows: list[dict], tone: str, city: bool = False) -> None:
+        nonlocal y
+        section_h = section_height(rows)
+        card(y, y + section_h)
+        accent = colors[tone]
+        accent_bg = colors[f"{tone}_bg"]
+        draw.rounded_rectangle((margin + 20, y + 20, width - margin - 20, y + 72), radius=14, fill=accent_bg)
+        draw_text(draw, (margin + 40, y + 29), title, 34, accent, bold=True)
+        draw_text_right(draw, width - margin - 42, y + 34, f"{len(rows)} 项" if rows else "—", 26, colors["subtle"])
+        header_y = y + section_header_h
+        draw.rectangle((margin + 20, header_y, width - margin - 20, header_y + table_header_h), fill="#F1F5F9")
+        if city:
+            draw_text(draw, (margin + 40, header_y + 15), "城市", 28, colors["subtle"], bold=True)
+            draw_text(draw, (margin + 385, header_y + 15), "区域", 28, colors["subtle"], bold=True)
+        else:
+            draw_text(draw, (margin + 40, header_y + 15), "区域", 28, colors["subtle"], bold=True)
+        draw_text_right(draw, width - margin - 42, header_y + 15, "当日利润", 28, colors["subtle"], bold=True)
 
-    panel_top = 570
-    panel_gap = 18
-    panel_left = 56
-    panel_width = int((page_right - panel_left - panel_gap * 2 - 36) / 3)
+        body_y = header_y + table_header_h
+        if rows:
+            for idx, row in enumerate(rows):
+                row_y = body_y + idx * row_h
+                if idx % 2 == 0:
+                    draw.rectangle((margin + 20, row_y, width - margin - 20, row_y + row_h), fill=colors["row_alt"])
+                if city:
+                    draw_text(draw, (margin + 40, row_y + 17), fit_text(draw, row["name"], 300, 32), 32, colors["headline"])
+                    draw_text(draw, (margin + 385, row_y + 17), fit_text(draw, row.get("region") or "—", 300, 30), 30, colors["subtle"])
+                else:
+                    draw_text(draw, (margin + 40, row_y + 17), fit_text(draw, row["name"], 610, 32), 32, colors["headline"])
+                draw_text_right(draw, width - margin - 42, row_y + 14, fmt(row["total"]), 34, signed_color(row["total"], colors["growth"]), bold=True)
+                draw.line((margin + 32, row_y + row_h, width - margin - 32, row_y + row_h), fill="#EDF1F6", width=1)
+        else:
+            message = "城市利润明细尚未抓取，下钻任务完成后自动展示" if city and not report.get("city_details_available") else (
+                "当日无亏损城市" if city else f"当日无{title}"
+            )
+            color = colors["subtle"] if not report.get("city_details_available") else colors["growth"]
+            draw_text(draw, (margin + 40, body_y + 18), message, 30, color, bold=True)
+        y += section_h + gap
 
-    def panel_x(index: int) -> tuple[int, int]:
-        x1 = panel_left + index * (panel_width + panel_gap)
-        return x1, x1 + panel_width
-
-    def draw_panel_row_bg(x1: int, x2: int, y: int, idx: int) -> None:
-        draw.rectangle((x1 + 10, y, x2 - 10, y + 62), fill=colors["row_alt"] if idx % 2 == 0 else "#FFFFFF")
-        draw.line((x1 + 10, y + 62, x2 - 10, y + 62), fill="#EDF1F7", width=1)
-
-    # Panel 1: profitable regions
-    r1x1, r1x2 = panel_x(0)
-    draw.rounded_rectangle((r1x1, panel_top, r1x2, panel_bottom), radius=16, fill="#F8FCF8", outline="#D9ECDC", width=2)
-    draw.rounded_rectangle((r1x1 + 10, panel_top + 12, r1x2 - 10, panel_top + 58), radius=10, fill="#E8F6EC")
-    draw_text(draw, (r1x1 + 22, panel_top + 24), "盈利区域", 24, colors["growth"], bold=True)
-    draw_text(draw, (r1x1 + 22, panel_top + 84), "区域", 20, colors["subtle"], bold=True)
-    draw_text_right(draw, r1x2 - 22, panel_top + 84, "当日利润", 20, colors["subtle"], bold=True)
-    for idx in range(detail_row_count):
-        y = panel_top + 120 + idx * 62
-        draw_panel_row_bg(r1x1, r1x2, y, idx)
-        row = profit_rows[idx] if idx < len(profit_rows) else None
-        if not row:
-            continue
-        name = fit_text(draw, row["name"], r1x2 - r1x1 - 170, 21)
-        draw_text(draw, (r1x1 + 24, y + 18), name, 21, colors["headline"])
-        draw_text_right(draw, r1x2 - 24, y + 18, fmt(row["total"]), 21, signed_color(row["total"], colors["growth"]), bold=True)
-
-    # Panel 2: loss regions
-    r2x1, r2x2 = panel_x(1)
-    draw.rounded_rectangle((r2x1, panel_top, r2x2, panel_bottom), radius=16, fill="#FDF8F8", outline="#F0DADA", width=2)
-    draw.rounded_rectangle((r2x1 + 10, panel_top + 12, r2x2 - 10, panel_top + 58), radius=10, fill="#FCECEC")
-    draw_text(draw, (r2x1 + 22, panel_top + 24), "亏损区域", 24, colors["risk"], bold=True)
-    draw_text(draw, (r2x1 + 22, panel_top + 84), "区域", 20, colors["subtle"], bold=True)
-    draw_text_right(draw, r2x2 - 22, panel_top + 84, "当日利润", 20, colors["subtle"], bold=True)
-    for idx in range(detail_row_count):
-        y = panel_top + 120 + idx * 62
-        draw_panel_row_bg(r2x1, r2x2, y, idx)
-        row = region_loss_rows[idx] if idx < len(region_loss_rows) else None
-        if not row:
-            continue
-        name = fit_text(draw, row["name"], r2x2 - r2x1 - 170, 21)
-        draw_text(draw, (r2x1 + 24, y + 18), name, 21, colors["headline"])
-        draw_text_right(draw, r2x2 - 24, y + 18, fmt(row["total"]), 21, signed_color(row["total"], colors["growth"]), bold=True)
-
-    # Panel 3: loss cities
-    r3x1, r3x2 = panel_x(2)
-    draw.rounded_rectangle((r3x1, panel_top, r3x2, panel_bottom), radius=16, fill="#F9FAFC", outline=colors["border"], width=2)
-    draw.rounded_rectangle((r3x1 + 10, panel_top + 12, r3x2 - 10, panel_top + 58), radius=10, fill="#EEF3FA")
-    draw_text(draw, (r3x1 + 22, panel_top + 24), "亏损城市", 24, colors["primary"], bold=True)
-    draw_text(draw, (r3x1 + 18, panel_top + 84), "城市", 20, colors["subtle"], bold=True)
-    draw_text(draw, (r3x1 + 160, panel_top + 84), "区域", 20, colors["subtle"], bold=True)
-    draw_text_right(draw, r3x2 - 22, panel_top + 84, "当日利润", 20, colors["subtle"], bold=True)
-    for idx in range(detail_row_count):
-        y = panel_top + 120 + idx * 62
-        draw_panel_row_bg(r3x1, r3x2, y, idx)
-        row = loss_rows[idx] if idx < len(loss_rows) else None
-        if not row:
-            continue
-        city_name = fit_text(draw, row["name"], 128, 20)
-        region_name = fit_text(draw, row.get("region", "-") or "-", 130, 20)
-        draw_text(draw, (r3x1 + 18, y + 19), city_name, 20, colors["headline"])
-        draw_text(draw, (r3x1 + 160, y + 19), region_name, 20, colors["subtle"])
-        draw_text_right(draw, r3x2 - 22, y + 19, fmt(row["total"]), 21, signed_color(row["total"], colors["growth"]), bold=True)
-    if not report.get("city_details_available"):
-        draw_text(draw, (r3x1 + 38, panel_top + 190), "数据源暂未返回", 23, colors["subtle"], bold=True)
-        draw_text(draw, (r3x1 + 38, panel_top + 226), "城市明细", 23, colors["subtle"], bold=True)
-    elif not loss_rows:
-        draw_text(draw, (r3x1 + 38, panel_top + 190), "当日无亏损城市", 23, colors["growth"], bold=True)
+    draw_section("盈利区域", profit_rows, "growth")
+    draw_section("亏损区域", region_loss_rows, "risk")
+    draw_section("亏损城市", loss_rows, "primary", city=True)
 
     out = OUTPUT_DIR / f"profit-report-{report['date_text']}.png"
-    image.save(out, format="PNG")
+    image.save(out, format="PNG", optimize=True, compress_level=9)
     return out
 
 
@@ -725,6 +715,20 @@ def run() -> int:
 
         payload = fetch_payload(args.source, args.sample_file)
         report = normalize_profit_payload(payload)
+        if args.source == "auto" and not report["city_details_available"]:
+            log("http_json_missing_city_details", action="fallback_to_powerbi_scrape")
+            payload = scrape_powerbi_payload(os.getenv("POWERBI_REPORT_URL", DEFAULT_POWERBI_URL))
+            report = normalize_profit_payload(payload)
+        if not report["city_details_available"]:
+            log("city_details_unavailable", action="render_clear_placeholder")
+
+        if args.source != "sample":
+            latest_payload = ROOT / "data" / "latest-profit-payload.json"
+            latest_payload.parent.mkdir(parents=True, exist_ok=True)
+            latest_payload.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+                encoding="utf-8",
+            )
         validate_profit_report(
             report,
             now=dt.datetime.now(),

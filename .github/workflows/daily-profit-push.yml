@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       source_mode:
-        description: "auto/http_json/powerbi_scrape/sample"
+        description: "powerbi_scrape (production) / http_json"
         required: false
-        default: "auto"
+        default: "powerbi_scrape"
       dry_run:
         description: "Run without sending WeCom messages"
         required: false
@@ -18,18 +18,25 @@ on:
 jobs:
   push-profit:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    concurrency:
+      group: daily-profit-push
+      cancel-in-progress: false
     permissions:
       contents: read
+      actions: read
 
     env:
       TZ: Asia/Shanghai
+      GH_TOKEN: ${{ github.token }}
       WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
       PROFIT_DATA_JSON_URL: ${{ secrets.PROFIT_DATA_JSON_URL }}
       PROFIT_DATA_JSON_HEADERS: ${{ secrets.PROFIT_DATA_JSON_HEADERS }}
+      POWERBI_STORAGE_STATE_B64: ${{ secrets.POWERBI_STORAGE_STATE_B64 }}
       POWERBI_REPORT_URL: ${{ vars.POWERBI_REPORT_URL }}
       TARGET_DATA_LAG_DAYS: ${{ vars.TARGET_DATA_LAG_DAYS || '2' }}
       MAX_DATA_LAG_DAYS: ${{ vars.MAX_DATA_LAG_DAYS || '2' }}
+      REQUIRE_CITY_DETAILS: "true"
       WECOM_MAX_ATTEMPTS: ${{ vars.WECOM_MAX_ATTEMPTS || '4' }}
       WECOM_TIMEOUT_SECONDS: ${{ vars.WECOM_TIMEOUT_SECONDS || '30' }}
       WECOM_RETRY_BASE_SECONDS: ${{ vars.WECOM_RETRY_BASE_SECONDS || '1.5' }}
@@ -44,7 +51,11 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r cloud_push/requirements.txt
+        run: |
+          pip install -r cloud_push/requirements.txt
+          python -m playwright install --with-deps chromium
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk
 
       - name: Restore push state cache
         id: state-cache-restore
@@ -55,19 +66,46 @@ jobs:
           restore-keys: |
             profit-push-state-
 
+      - name: Restore state artifact fallback
+        if: steps.state-cache-restore.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          if [ -s cloud_push/.state/state.json ]; then
+            echo "state restored from cache prefix"
+            exit 0
+          fi
+          mkdir -p /tmp/previous-profit-state cloud_push/.state
+          for RUN_ID in $(gh run list --workflow daily-profit-push.yml --status completed --limit 20 \
+            --json databaseId,conclusion --jq '.[] | select(.conclusion == "success") | .databaseId'); do
+            if gh run download "${RUN_ID}" -n "profit-push-artifacts-${RUN_ID}" \
+              -D /tmp/previous-profit-state >/dev/null 2>&1; then
+              python - <<'PY'
+          from pathlib import Path
+          import shutil
+          candidates = list(Path("/tmp/previous-profit-state").rglob("state.json"))
+          if candidates:
+              shutil.copy2(candidates[0], "cloud_push/.state/state.json")
+          PY
+              if [ -s cloud_push/.state/state.json ]; then
+                echo "state restored from previous workflow artifact"
+                break
+              fi
+            fi
+          done
+
       - name: Run cloud push
         run: |
           set -euo pipefail
           SOURCE_MODE="${{ github.event.inputs.source_mode }}"
           if [ -z "${SOURCE_MODE}" ]; then
-            if [ "${{ github.event_name }}" = "schedule" ]; then
-              SOURCE_MODE="auto"
-            else
-              SOURCE_MODE="auto"
-            fi
+            SOURCE_MODE="powerbi_scrape"
           fi
-          if [ "${{ github.event_name }}" = "schedule" ] && [ "${SOURCE_MODE}" = "sample" ]; then
-            echo "schedule 禁止使用 sample 数据源"
+          if [ "${SOURCE_MODE}" = "sample" ]; then
+            echo "云端工作流禁止使用 sample 数据源"
+            exit 1
+          fi
+          if [ "${SOURCE_MODE}" = "powerbi_scrape" ] && [ -z "${POWERBI_STORAGE_STATE_B64}" ]; then
+            echo "缺少 POWERBI_STORAGE_STATE_B64"
             exit 1
           fi
           DRY_ARG=""
@@ -78,7 +116,16 @@ jobs:
             DRY_ARG=""
           fi
           echo "run source mode: ${SOURCE_MODE}"
-          python cloud_push/profit_cloud_push.py --source "${SOURCE_MODE}" ${DRY_ARG}
+          for ATTEMPT in 1 2; do
+            if python cloud_push/profit_cloud_push.py --source "${SOURCE_MODE}" ${DRY_ARG}; then
+              exit 0
+            fi
+            if [ "${ATTEMPT}" -eq 2 ]; then
+              exit 1
+            fi
+            echo "Power BI 抓取失败，20 秒后重试"
+            sleep 20
+          done
 
       - name: Save push state cache
         if: always()
@@ -96,4 +143,5 @@ jobs:
             cloud_push/outputs/*.png
             cloud_push/outputs/*.md
             cloud_push/.state/state.json
+          include-hidden-files: true
           if-no-files-found: ignore

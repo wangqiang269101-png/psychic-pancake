@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
+import json
+import math
+import os
 import re
 from typing import Any
 
@@ -28,13 +32,13 @@ SKIP_LINES = {
 }
 
 
-def load_browser_cookies() -> list[dict[str, str]]:
+def load_browser_cookies() -> list[dict[str, Any]]:
     try:
         import browser_cookie3
     except ImportError as exc:  # noqa: BLE001
         raise RuntimeError("缺少 browser-cookie3，请安装 cloud_push/requirements.txt。") from exc
 
-    cookies: list[dict[str, str]] = []
+    cookies: list[dict[str, Any]] = []
     for cookie in browser_cookie3.chrome():
         if any(
             domain in cookie.domain
@@ -46,11 +50,29 @@ def load_browser_cookies() -> list[dict[str, str]]:
                     "value": cookie.value,
                     "domain": cookie.domain,
                     "path": cookie.path or "/",
+                    "secure": bool(cookie.secure),
+                    "httpOnly": bool(cookie.has_nonstandard_attr("HttpOnly")),
                 }
             )
     if not cookies:
         raise RuntimeError("未从 Chrome 读取到 Power BI 登录 Cookie，请先在 Chrome 登录 Power BI。")
     return cookies
+
+
+def load_storage_state() -> dict[str, Any]:
+    """Load cloud auth from an encrypted secret, or safely extract local Chrome cookies."""
+    encoded = os.getenv("POWERBI_STORAGE_STATE_B64", "").strip()
+    if encoded:
+        try:
+            state = json.loads(base64.b64decode(encoded, validate=True).decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("POWERBI_STORAGE_STATE_B64 不是有效的 base64 Playwright storage state。") from exc
+        if not isinstance(state, dict) or not isinstance(state.get("cookies"), list):
+            raise RuntimeError("Power BI storage state 缺少 cookies 数组。")
+        if not state["cookies"]:
+            raise RuntimeError("Power BI storage state 中没有 Cookie。")
+        return state
+    return {"cookies": load_browser_cookies(), "origins": []}
 
 
 def parse_aria_number(label: str, marker: str) -> float:
@@ -196,21 +218,224 @@ def parse_monthly_totals(lines: list[str]) -> tuple[float, float, float]:
     raise ValueError("未解析到月累计 Total 行。")
 
 
+def _semantic_command(query_payload: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        return query_payload["queries"][0]["Query"]["Commands"][0]["SemanticQueryDataShapeCommand"]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def _projection_index(command: dict[str, Any], native_name: str) -> int | None:
+    for index, item in enumerate(command.get("Query", {}).get("Select", [])):
+        if str(item.get("NativeReferenceName", "")).strip() == native_name:
+            return index
+    return None
+
+
+def is_city_matrix_query(query_payload: dict[str, Any]) -> bool:
+    command = _semantic_command(query_payload)
+    if not command:
+        return False
+    required = ("区域", "城市", "权责总利润(万)")
+    return all(_projection_index(command, name) is not None for name in required)
+
+
+def expand_city_matrix_query(query_payload: dict[str, Any]) -> dict[str, Any]:
+    """Enable both region and city projections in the captured matrix query."""
+    expanded = json.loads(json.dumps(query_payload, ensure_ascii=False))
+    command = _semantic_command(expanded)
+    if not command:
+        raise ValueError("Power BI 城市矩阵 query 缺少 SemanticQueryDataShapeCommand。")
+
+    region_index = _projection_index(command, "区域")
+    city_index = _projection_index(command, "城市")
+    if region_index is None or city_index is None:
+        raise ValueError("Power BI 城市矩阵 query 缺少区域/城市层级。")
+
+    groupings = command.get("Binding", {}).get("Primary", {}).get("Groupings", [])
+    if not groupings:
+        raise ValueError("Power BI 城市矩阵 query 缺少 Primary Groupings。")
+    projections = groupings[0].setdefault("Projections", [])
+    if city_index not in projections:
+        insert_at = projections.index(region_index) + 1 if region_index in projections else 0
+        projections.insert(insert_at, city_index)
+
+    query = expanded["queries"][0]
+    query["CacheKey"] = json.dumps(
+        {"Commands": query["Query"]["Commands"]},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return expanded
+
+
+def _decode_dsr_rows(ds: dict[str, Any], member: str = "DM1") -> list[dict[str, Any]]:
+    """Decode Power BI's dictionary and bitmask-compressed matrix rows."""
+    raw_rows: list[dict[str, Any]] = []
+    for phase in ds.get("PH", []):
+        raw_rows.extend(phase.get(member, []))
+    if not raw_rows:
+        return []
+
+    dictionaries = ds.get("ValueDicts", {})
+    schema: list[dict[str, Any]] = []
+    previous: list[Any] = []
+    decoded: list[dict[str, Any]] = []
+
+    for raw in raw_rows:
+        if raw.get("S"):
+            schema = raw["S"]
+        if not schema:
+            continue
+        repeated = int(raw.get("R", 0))
+        nulls = int(raw.get("Ø", 0))
+        supplied = iter(raw.get("C", []))
+        values: list[Any] = []
+        for index, field in enumerate(schema):
+            if repeated & (1 << index):
+                value = previous[index]
+            elif nulls & (1 << index):
+                value = None
+            else:
+                value = next(supplied, None)
+            dictionary_name = field.get("DN")
+            if dictionary_name and isinstance(value, int):
+                dictionary = dictionaries.get(dictionary_name, [])
+                if 0 <= value < len(dictionary):
+                    value = dictionary[value]
+            values.append(value)
+        previous = values
+        decoded.append({field["N"]: values[index] for index, field in enumerate(schema)})
+    return decoded
+
+
+def parse_city_matrix_rows(
+    query_payload: dict[str, Any],
+    query_response: dict[str, Any],
+) -> list[dict[str, Any]]:
+    command = _semantic_command(query_payload)
+    if not command:
+        return []
+    try:
+        data = query_response["results"][0]["result"]["data"]
+        descriptor = data["descriptor"]["Select"]
+        ds = data["dsr"]["DS"][0]
+    except (KeyError, IndexError, TypeError):
+        return []
+
+    value_names: dict[str, str] = {}
+    selects = command.get("Query", {}).get("Select", [])
+    for index, semantic_select in enumerate(selects):
+        if index >= len(descriptor) or not descriptor[index]:
+            continue
+        native_name = str(semantic_select.get("NativeReferenceName", "")).strip()
+        value_name = descriptor[index].get("Value")
+        if native_name and value_name:
+            value_names[native_name] = value_name
+
+    required = ("区域", "城市", "权责总利润(万)")
+    if not all(name in value_names for name in required):
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for decoded in _decode_dsr_rows(ds):
+        region = decoded.get(value_names["区域"])
+        city = decoded.get(value_names["城市"])
+        total = decoded.get(value_names["权责总利润(万)"])
+        if not region or not city or total is None:
+            continue
+        try:
+            total_number = float(total)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(total_number):
+            continue
+
+        def optional_number(name: str) -> float | None:
+            value = decoded.get(value_names.get(name, ""))
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        rows.append(
+            {
+                "类型": "城市",
+                "区域": str(region),
+                "城市": str(city),
+                "当日总利润": total_number,
+                "当日外卖利润": optional_number("权责外卖利润(万)"),
+                "当日团购利润": optional_number("团购利润(万)"),
+            }
+        )
+    return rows
+
+
+def fetch_expanded_city_rows(
+    context: Any,
+    captured_queries: list[tuple[Any, dict[str, Any], dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Parse existing child rows, otherwise replay the visual query with city enabled."""
+    for _, query_payload, query_response in reversed(captured_queries):
+        rows = parse_city_matrix_rows(query_payload, query_response)
+        if rows:
+            return rows
+
+    if not captured_queries:
+        raise ValueError("未捕获到包含区域→城市层级的 Power BI visual query。")
+    request, query_payload, _ = captured_queries[-1]
+    expanded = expand_city_matrix_query(query_payload)
+    headers = {
+        key: value
+        for key, value in request.all_headers().items()
+        if not key.startswith(":")
+        and key.lower() not in {"content-length", "host", "origin", "referer"}
+    }
+    response = context.request.post(
+        request.url,
+        headers=headers,
+        data=expanded,
+        timeout=120000,
+    )
+    if response.status != 200:
+        raise RuntimeError(f"Power BI 城市展开 query 失败: HTTP {response.status} {response.text()[:300]}")
+    rows = parse_city_matrix_rows(expanded, response.json())
+    if not rows:
+        raise ValueError("Power BI 城市展开 query 成功，但未解析到城市明细。")
+    return rows
+
+
 def scrape_powerbi_payload(report_url: str) -> list[dict[str, Any]]:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:  # noqa: BLE001
         raise RuntimeError("缺少 playwright，请安装 cloud_push/requirements.txt。") from exc
 
-    cookies = load_browser_cookies()
+    storage_state = load_storage_state()
     aria_labels: list[str] = []
     body_text = ""
+    captured_city_queries: list[tuple[Any, dict[str, Any], dict[str, Any]]] = []
+    cities: list[dict[str, Any]] = []
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = browser.new_context(viewport={"width": 1920, "height": 1400})
-        context.add_cookies(cookies)
+        context = browser.new_context(
+            viewport={"width": 1920, "height": 1400},
+            storage_state=storage_state,
+        )
         page = context.new_page()
+
+        def capture_query_response(response: Any) -> None:
+            if "/public/query" not in response.url:
+                return
+            try:
+                query_payload = json.loads(response.request.post_data or "{}")
+                if is_city_matrix_query(query_payload):
+                    captured_city_queries.append((response.request, query_payload, response.json()))
+            except Exception:
+                return
+
+        page.on("response", capture_query_response)
         page.goto(report_url, wait_until="domcontentloaded", timeout=120000)
         page.wait_for_timeout(90000)
         for label in ("T-1财务利润", "T-1"):
@@ -230,6 +455,7 @@ def scrape_powerbi_payload(report_url: str) -> list[dict[str, Any]]:
                     aria_labels.append(label)
             except Exception:
                 continue
+        cities = fetch_expanded_city_rows(context, captured_city_queries)
         browser.close()
 
     daily_total = daily_delivery = daily_group = None
@@ -256,7 +482,6 @@ def scrape_powerbi_payload(report_url: str) -> list[dict[str, Any]]:
     lines = [line.strip() for line in body_text.splitlines()]
     month_total, month_delivery, month_group = parse_monthly_totals(lines)
     regions = parse_region_rows(lines)
-    cities = parse_city_aria_rows(aria_labels)
     if not regions:
         raise ValueError("未解析到区域利润明细。")
 
