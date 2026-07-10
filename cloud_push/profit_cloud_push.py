@@ -171,6 +171,12 @@ def scrape_powerbi_payload(report_url: str) -> Any:
         candidate_rows=len(rows),
         date=(company or {}).get("日期"),
         regions=sum(1 for row in rows if str(row.get("类型", "")).strip() == "区域"),
+        cities=sum(
+            1
+            for row in rows
+            if str(row.get("类型", "")).strip() == "城市"
+            or bool(row.get("城市") or row.get("城市名称") or row.get("外卖城市"))
+        ),
     )
     return rows
 
@@ -268,6 +274,13 @@ def normalize_row(row: dict) -> dict:
     return out
 
 
+def row_value(row: dict, *aliases: str) -> Any:
+    for alias in aliases:
+        if alias in row and row[alias] not in (None, ""):
+            return row[alias]
+    return None
+
+
 def normalize_profit_payload(payload: Any) -> dict:
     rows = payload
     if not isinstance(rows, list):
@@ -282,80 +295,101 @@ def normalize_profit_payload(payload: Any) -> dict:
         raise ValueError("数据不是可识别的行数组。")
 
     normalized_rows = [normalize_row(row) for row in rows]
-    company_row = next((r for r in normalized_rows if str(r.get("类型", "")).strip() == "公司"), None)
+    company_row = next(
+        (
+            row
+            for row in normalized_rows
+            if str(row_value(row, "类型", "数据类型", "层级") or "").strip() == "公司"
+        ),
+        None,
+    )
     if not company_row:
         raise ValueError("未找到 类型=公司 汇总行。")
 
-    report_date = parse_date(company_row.get("日期"))
+    report_date = parse_date(row_value(company_row, "日期", "数据日期", "统计日期"))
     accounted_days = max(1, report_date.day)
     days_in_month = calendar.monthrange(report_date.year, report_date.month)[1]
 
-    month_total = to_number(company_row.get("月累计总利润"))
-    month_delivery = to_number(company_row.get("月累计外卖利润"))
-    month_group = to_number(company_row.get("月累计团购利润"))
+    month_total = to_number(row_value(company_row, "月累计总利润", "月累计权责总利润"))
+    month_delivery = to_number(row_value(company_row, "月累计外卖利润", "月累计权责外卖利润"))
+    month_group = to_number(row_value(company_row, "月累计团购利润"))
 
     regions = []
+    city_detail_rows = 0
     loss_cities = []
     for row in normalized_rows:
-        row_type = str(row.get("类型", "")).strip()
-        if row_type == "区域" and row.get("区域"):
+        row_type = str(row_value(row, "类型", "数据类型", "层级") or "").strip()
+        region_name = row_value(row, "区域", "区域名称", "大区")
+        if row_type == "区域" and region_name:
             regions.append(
                 {
-                    "name": str(row.get("区域")),
-                    "total": to_number(row.get("当日总利润")),
-                    "delivery": to_number(row.get("当日外卖利润")),
-                    "group": to_number(row.get("当日团购利润")),
+                    "name": str(region_name),
+                    "total": to_number(row_value(row, "当日总利润", "当日权责总利润", "权责总利润(万)", "权责总利润")),
+                    "delivery": to_number(
+                        row_value(row, "当日外卖利润", "当日权责外卖利润", "权责外卖利润(万)", "权责外卖利润")
+                    ),
+                    "group": to_number(row_value(row, "当日团购利润", "团购利润(万)", "团购利润")),
                 }
             )
             continue
 
-        city_name = row.get("城市") or row.get("城") or row.get("城市名称")
+        city_name = row_value(row, "城市", "城", "城市名称", "外卖城市")
         if row_type == "城市" or city_name:
-            total = to_number(row.get("当日总利润"))
+            city_detail_rows += 1
+            total = to_number(row_value(row, "当日总利润", "当日权责总利润", "权责总利润(万)", "权责总利润"))
             if city_name and math.isfinite(total) and total < 0:
                 loss_cities.append(
                     {
                         "name": str(city_name),
-                        "region": str(row.get("区域") or ""),
+                        "region": str(region_name or ""),
                         "total": total,
-                        "delivery": to_number(row.get("当日外卖利润")),
-                        "group": to_number(row.get("当日团购利润")),
+                        "delivery": to_number(
+                            row_value(row, "当日外卖利润", "当日权责外卖利润", "权责外卖利润(万)", "权责外卖利润")
+                        ),
+                        "group": to_number(row_value(row, "当日团购利润", "团购利润(万)", "团购利润")),
                     }
                 )
     regions.sort(key=lambda x: x["total"], reverse=True)
     loss_cities.sort(key=lambda x: x["total"])
 
-    rise_regions = [item for item in regions if math.isfinite(item["total"]) and item["total"] > 0][:8]
-    if not rise_regions:
-        rise_regions = regions[:8]
-
-    fall_regions = sorted(regions, key=lambda x: x["total"])
-    negative_fall_regions = [item for item in fall_regions if math.isfinite(item["total"]) and item["total"] < 0][:8]
-    if negative_fall_regions:
-        fall_regions = negative_fall_regions
-    else:
-        fall_regions = fall_regions[:8]
+    profit_regions = [item for item in regions if math.isfinite(item["total"]) and item["total"] >= 0]
+    loss_regions = sorted(
+        [item for item in regions if math.isfinite(item["total"]) and item["total"] < 0],
+        key=lambda x: x["total"],
+    )
 
     return {
         "date": report_date,
         "date_text": report_date.strftime("%Y-%m-%d"),
         "company": {
-            "daily_total": to_number(company_row.get("当日总利润")),
-            "daily_delivery": to_number(company_row.get("当日外卖利润")),
-            "daily_group": to_number(company_row.get("当日团购利润")),
+            "daily_total": to_number(
+                row_value(company_row, "当日总利润", "当日权责总利润", "权责总利润(万)", "权责总利润")
+            ),
+            "daily_delivery": to_number(
+                row_value(company_row, "当日外卖利润", "当日权责外卖利润", "权责外卖利润(万)", "权责外卖利润")
+            ),
+            "daily_group": to_number(row_value(company_row, "当日团购利润", "团购利润(万)", "团购利润")),
             "month_total": month_total,
             "month_delivery": month_delivery,
             "month_group": month_group,
-            "forecast_total": number_or_fallback(company_row.get("本月预计总利润"), month_total / accounted_days * days_in_month),
-            "forecast_delivery": number_or_fallback(
-                company_row.get("本月预计外卖利润"), month_delivery / accounted_days * days_in_month
+            "forecast_total": number_or_fallback(
+                row_value(company_row, "本月预计总利润", "本月预计权责总利润"),
+                month_total / accounted_days * days_in_month,
             ),
-            "forecast_group": number_or_fallback(company_row.get("本月预计团购利润"), month_group / accounted_days * days_in_month),
+            "forecast_delivery": number_or_fallback(
+                row_value(company_row, "本月预计外卖利润", "本月预计权责外卖利润"),
+                month_delivery / accounted_days * days_in_month,
+            ),
+            "forecast_group": number_or_fallback(
+                row_value(company_row, "本月预计团购利润"),
+                month_group / accounted_days * days_in_month,
+            ),
         },
-        "regions": regions[:12],
-        "region_rise": rise_regions,
-        "region_fall": fall_regions,
-        "loss_cities": loss_cities[:12],
+        "regions": regions,
+        "profit_regions": profit_regions,
+        "loss_regions": loss_regions,
+        "city_details_available": city_detail_rows > 0,
+        "loss_cities": loss_cities,
     }
 
 
@@ -472,7 +506,13 @@ def signed_color(value: float, positive: str = "#1A7F37") -> str:
 
 def render_profit_image(report: dict) -> Path:
     c = report["company"]
-    image = Image.new("RGB", (1500, 1280), "#F4F6FA")
+    profit_rows = report.get("profit_regions") or []
+    region_loss_rows = report.get("loss_regions") or []
+    loss_rows = report.get("loss_cities") or []
+    detail_row_count = max(8, len(profit_rows), len(region_loss_rows), len(loss_rows))
+    panel_bottom = 720 + detail_row_count * 62
+    detail_bottom = panel_bottom + 28
+    image = Image.new("RGB", (1500, detail_bottom + 36), "#F4F6FA")
     draw = ImageDraw.Draw(image)
     colors = {
         "surface": "#FFFFFF",
@@ -521,7 +561,6 @@ def render_profit_image(report: dict) -> Path:
 
     # Detail section
     detail_top = 458
-    detail_bottom = 1244
     draw.rounded_rectangle(
         (page_left, detail_top, page_right, detail_bottom),
         radius=20,
@@ -529,11 +568,10 @@ def render_profit_image(report: dict) -> Path:
         outline=colors["border"],
         width=2,
     )
-    draw_text(draw, (66, 488), "区域涨跌与亏损城市明细", 32, colors["headline"], bold=True)
-    draw_text(draw, (66, 530), "负数红色标识风险，正数绿色标识增长", 20, colors["subtle"])
+    draw_text(draw, (66, 488), "区域盈亏与亏损城市明细", 32, colors["headline"], bold=True)
+    draw_text(draw, (66, 530), "亏损仅指当日利润小于 0，不代表环比下滑", 20, colors["subtle"])
 
     panel_top = 570
-    panel_bottom = 1216
     panel_gap = 18
     panel_left = 56
     panel_width = int((page_right - panel_left - panel_gap * 2 - 36) / 3)
@@ -546,38 +584,34 @@ def render_profit_image(report: dict) -> Path:
         draw.rectangle((x1 + 10, y, x2 - 10, y + 62), fill=colors["row_alt"] if idx % 2 == 0 else "#FFFFFF")
         draw.line((x1 + 10, y + 62, x2 - 10, y + 62), fill="#EDF1F7", width=1)
 
-    rise_rows = report.get("region_rise") or []
-    fall_rows = report.get("region_fall") or []
-    loss_rows = report.get("loss_cities") or []
-
-    # Panel 1: rising regions
+    # Panel 1: profitable regions
     r1x1, r1x2 = panel_x(0)
     draw.rounded_rectangle((r1x1, panel_top, r1x2, panel_bottom), radius=16, fill="#F8FCF8", outline="#D9ECDC", width=2)
     draw.rounded_rectangle((r1x1 + 10, panel_top + 12, r1x2 - 10, panel_top + 58), radius=10, fill="#E8F6EC")
-    draw_text(draw, (r1x1 + 22, panel_top + 24), "区域上涨", 24, colors["growth"], bold=True)
+    draw_text(draw, (r1x1 + 22, panel_top + 24), "盈利区域", 24, colors["growth"], bold=True)
     draw_text(draw, (r1x1 + 22, panel_top + 84), "区域", 20, colors["subtle"], bold=True)
     draw_text_right(draw, r1x2 - 22, panel_top + 84, "当日利润", 20, colors["subtle"], bold=True)
-    for idx in range(8):
+    for idx in range(detail_row_count):
         y = panel_top + 120 + idx * 62
         draw_panel_row_bg(r1x1, r1x2, y, idx)
-        row = rise_rows[idx] if idx < len(rise_rows) else None
+        row = profit_rows[idx] if idx < len(profit_rows) else None
         if not row:
             continue
         name = fit_text(draw, row["name"], r1x2 - r1x1 - 170, 21)
         draw_text(draw, (r1x1 + 24, y + 18), name, 21, colors["headline"])
         draw_text_right(draw, r1x2 - 24, y + 18, fmt(row["total"]), 21, signed_color(row["total"], colors["growth"]), bold=True)
 
-    # Panel 2: falling regions
+    # Panel 2: loss regions
     r2x1, r2x2 = panel_x(1)
     draw.rounded_rectangle((r2x1, panel_top, r2x2, panel_bottom), radius=16, fill="#FDF8F8", outline="#F0DADA", width=2)
     draw.rounded_rectangle((r2x1 + 10, panel_top + 12, r2x2 - 10, panel_top + 58), radius=10, fill="#FCECEC")
-    draw_text(draw, (r2x1 + 22, panel_top + 24), "区域下滑", 24, colors["risk"], bold=True)
+    draw_text(draw, (r2x1 + 22, panel_top + 24), "亏损区域", 24, colors["risk"], bold=True)
     draw_text(draw, (r2x1 + 22, panel_top + 84), "区域", 20, colors["subtle"], bold=True)
     draw_text_right(draw, r2x2 - 22, panel_top + 84, "当日利润", 20, colors["subtle"], bold=True)
-    for idx in range(8):
+    for idx in range(detail_row_count):
         y = panel_top + 120 + idx * 62
         draw_panel_row_bg(r2x1, r2x2, y, idx)
-        row = fall_rows[idx] if idx < len(fall_rows) else None
+        row = region_loss_rows[idx] if idx < len(region_loss_rows) else None
         if not row:
             continue
         name = fit_text(draw, row["name"], r2x2 - r2x1 - 170, 21)
@@ -592,7 +626,7 @@ def render_profit_image(report: dict) -> Path:
     draw_text(draw, (r3x1 + 18, panel_top + 84), "城市", 20, colors["subtle"], bold=True)
     draw_text(draw, (r3x1 + 160, panel_top + 84), "区域", 20, colors["subtle"], bold=True)
     draw_text_right(draw, r3x2 - 22, panel_top + 84, "当日利润", 20, colors["subtle"], bold=True)
-    for idx in range(8):
+    for idx in range(detail_row_count):
         y = panel_top + 120 + idx * 62
         draw_panel_row_bg(r3x1, r3x2, y, idx)
         row = loss_rows[idx] if idx < len(loss_rows) else None
@@ -603,6 +637,11 @@ def render_profit_image(report: dict) -> Path:
         draw_text(draw, (r3x1 + 18, y + 19), city_name, 20, colors["headline"])
         draw_text(draw, (r3x1 + 160, y + 19), region_name, 20, colors["subtle"])
         draw_text_right(draw, r3x2 - 22, y + 19, fmt(row["total"]), 21, signed_color(row["total"], colors["growth"]), bold=True)
+    if not report.get("city_details_available"):
+        draw_text(draw, (r3x1 + 38, panel_top + 190), "数据源暂未返回", 23, colors["subtle"], bold=True)
+        draw_text(draw, (r3x1 + 38, panel_top + 226), "城市明细", 23, colors["subtle"], bold=True)
+    elif not loss_rows:
+        draw_text(draw, (r3x1 + 38, panel_top + 190), "当日无亏损城市", 23, colors["growth"], bold=True)
 
     out = OUTPUT_DIR / f"profit-report-{report['date_text']}.png"
     image.save(out, format="PNG")
@@ -614,6 +653,8 @@ def compute_fingerprint(report: dict) -> str:
         "date": report["date_text"],
         "company": report["company"],
         "regions": report["regions"],
+        "city_details_available": report.get("city_details_available"),
+        "loss_cities": report.get("loss_cities"),
     }
     raw = json.dumps(digest_input, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
