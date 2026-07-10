@@ -160,57 +160,19 @@ def fetch_http_json_payload() -> Any:
 
 def scrape_powerbi_payload(report_url: str) -> Any:
     log("powerbi_scrape_start", report_url=report_url)
-    try:
-        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-        from playwright.sync_api import sync_playwright
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError("缺少 playwright 依赖，请安装 requirements 或切换到 http_json 模式。") from exc
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from powerbi_scraper import scrape_powerbi_payload as scrape_from_dom
 
-    candidates: list[Any] = []
-
-    def maybe_collect_json(obj: Any) -> None:
-        if isinstance(obj, (dict, list)):
-            candidates.append(obj)
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = browser.new_context(viewport={"width": 1600, "height": 1000})
-        page = context.new_page()
-
-        def on_response(resp):
-            try:
-                ctype = (resp.headers or {}).get("content-type", "")
-                if "json" not in ctype.lower():
-                    return
-                data = resp.json()
-                maybe_collect_json(data)
-            except Exception:
-                return
-
-        page.on("response", on_response)
-        try:
-            page.goto(report_url, wait_until="domcontentloaded", timeout=90000)
-            page.wait_for_timeout(22000)
-        except PlaywrightTimeoutError:
-            log("powerbi_scrape_timeout", note="继续尝试解析已捕获请求")
-        finally:
-            browser.close()
-
-    if not candidates:
-        raise RuntimeError("未从 Power BI 页面捕获到 JSON 响应。")
-
-    best_rows = None
-    best_score = -1
-    for item in candidates:
-        for rows in extract_candidate_rows(item):
-            score = score_rows(rows)
-            if score > best_score:
-                best_score = score
-                best_rows = rows
-    if not best_rows:
-        raise RuntimeError("已捕获响应，但未识别到利润行数据结构。请改用 http_json 模式。")
-    log("powerbi_scrape_ok", candidate_rows=len(best_rows), score=best_score)
-    return best_rows
+    rows = scrape_from_dom(report_url)
+    company = next((row for row in rows if str(row.get("类型", "")).strip() == "公司"), None)
+    log(
+        "powerbi_scrape_ok",
+        candidate_rows=len(rows),
+        date=(company or {}).get("日期"),
+        regions=sum(1 for row in rows if str(row.get("类型", "")).strip() == "区域"),
+    )
+    return rows
 
 
 def extract_candidate_rows(obj: Any) -> list[list[dict]]:
