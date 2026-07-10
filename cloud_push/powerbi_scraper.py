@@ -9,6 +9,7 @@ import math
 import os
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 REGION_NAMES = [
     "川藏一区",
@@ -72,7 +73,28 @@ def load_storage_state() -> dict[str, Any]:
         if not state["cookies"]:
             raise RuntimeError("Power BI storage state 中没有 Cookie。")
         return state
+    if os.getenv("GITHUB_ACTIONS", "").lower() == "true":
+        raise RuntimeError(
+            "Power BI 云端认证缺失：POWERBI_STORAGE_STATE_B64 未配置，"
+            "GitHub runner 不允许回退到本机 Chrome profile。"
+        )
     return {"cookies": load_browser_cookies(), "origins": []}
+
+
+def _is_auth_endpoint(url: str) -> bool:
+    hostname = (urlparse(url).hostname or "").lower()
+    return any(
+        hostname == domain or hostname.endswith(f".{domain}")
+        for domain in ("powerbi.com", "microsoftonline.com", "analysis.windows.net")
+    )
+
+
+def _storage_state_changed(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    return json.dumps(before, sort_keys=True, separators=(",", ":")) != json.dumps(
+        after,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def parse_aria_number(label: str, marker: str) -> float:
@@ -416,6 +438,7 @@ def scrape_powerbi_payload(report_url: str) -> list[dict[str, Any]]:
     body_text = ""
     captured_city_queries: list[tuple[Any, dict[str, Any], dict[str, Any]]] = []
     cities: list[dict[str, Any]] = []
+    auth_failure_statuses: set[int] = set()
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True, args=["--no-sandbox"])
@@ -423,40 +446,69 @@ def scrape_powerbi_payload(report_url: str) -> list[dict[str, Any]]:
             viewport={"width": 1920, "height": 1400},
             storage_state=storage_state,
         )
-        page = context.new_page()
+        try:
+            page = context.new_page()
 
-        def capture_query_response(response: Any) -> None:
-            if "/public/query" not in response.url:
-                return
-            try:
-                query_payload = json.loads(response.request.post_data or "{}")
-                if is_city_matrix_query(query_payload):
-                    captured_city_queries.append((response.request, query_payload, response.json()))
-            except Exception:
-                return
+            def capture_query_response(response: Any) -> None:
+                if (
+                    response.status in (401, 403)
+                    and "/public/query" in response.url
+                    and _is_auth_endpoint(response.url)
+                ):
+                    auth_failure_statuses.add(response.status)
+                if "/public/query" not in response.url:
+                    return
+                try:
+                    query_payload = json.loads(response.request.post_data or "{}")
+                    if is_city_matrix_query(query_payload):
+                        captured_city_queries.append((response.request, query_payload, response.json()))
+                except Exception:
+                    return
 
-        page.on("response", capture_query_response)
-        page.goto(report_url, wait_until="domcontentloaded", timeout=120000)
-        page.wait_for_timeout(90000)
-        for label in ("T-1财务利润", "T-1"):
-            try:
-                locator = page.get_by_text(label, exact=False).first
-                if locator.count() > 0:
-                    locator.click(timeout=3000)
-                    page.wait_for_timeout(12000)
-                    break
-            except Exception:
-                pass
-        body_text = page.inner_text("body")
-        for element in page.locator("[aria-label]").all():
-            try:
-                label = element.get_attribute("aria-label")
-                if label:
-                    aria_labels.append(label)
-            except Exception:
-                continue
-        cities = fetch_expanded_city_rows(context, captured_city_queries)
-        browser.close()
+            page.on("response", capture_query_response)
+            page.goto(report_url, wait_until="domcontentloaded", timeout=120000)
+            page.wait_for_timeout(90000)
+            for label in ("T-1财务利润", "T-1"):
+                try:
+                    locator = page.get_by_text(label, exact=False).first
+                    if locator.count() > 0:
+                        locator.click(timeout=3000)
+                        page.wait_for_timeout(12000)
+                        break
+                except Exception:
+                    pass
+            body_text = page.inner_text("body")
+            current_host = (urlparse(page.url).hostname or "").lower()
+            if auth_failure_statuses:
+                statuses = ",".join(str(status) for status in sorted(auth_failure_statuses))
+                raise RuntimeError(
+                    f"Power BI 认证已失效（HTTP {statuses}）；请安全更新 POWERBI_STORAGE_STATE_B64。"
+                )
+            if current_host.endswith("microsoftonline.com") or (
+                not captured_city_queries
+                and any(marker in body_text.lower() for marker in ("sign in", "登录", "登入"))
+            ):
+                raise RuntimeError(
+                    "Power BI 认证已失效或触发条件访问登录；请安全更新 POWERBI_STORAGE_STATE_B64。"
+                )
+            for element in page.locator("[aria-label]").all():
+                try:
+                    label = element.get_attribute("aria-label")
+                    if label:
+                        aria_labels.append(label)
+                except Exception:
+                    continue
+            cities = fetch_expanded_city_rows(context, captured_city_queries)
+            refreshed_state = context.storage_state()
+            os.environ["POWERBI_AUTH_STATE_CHANGED"] = str(
+                _storage_state_changed(storage_state, refreshed_state)
+            ).lower()
+            os.environ["POWERBI_AUTH_ORIGIN_STORAGE_PRESENT"] = str(
+                bool(storage_state.get("origins"))
+            ).lower()
+        finally:
+            context.close()
+            browser.close()
 
     daily_total = daily_delivery = daily_group = None
     date_text = None

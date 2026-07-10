@@ -174,6 +174,13 @@ def scrape_powerbi_payload(report_url: str) -> Any:
     rows = scrape_from_dom(report_url)
     company = next((row for row in rows if str(row.get("类型", "")).strip() == "公司"), None)
     log(
+        "powerbi_auth_state",
+        changed_in_memory=os.getenv("POWERBI_AUTH_STATE_CHANGED", "unknown"),
+        origin_storage_present=os.getenv("POWERBI_AUTH_ORIGIN_STORAGE_PRESENT", "unknown"),
+        persisted=False,
+        reason="GitHub Actions cannot safely update repository secrets with GITHUB_TOKEN",
+    )
+    log(
         "powerbi_scrape_ok",
         candidate_rows=len(rows),
         date=(company or {}).get("日期"),
