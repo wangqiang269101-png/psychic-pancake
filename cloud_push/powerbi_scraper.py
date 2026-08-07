@@ -498,7 +498,12 @@ def scrape_powerbi_payload(report_url: str) -> list[dict[str, Any]]:
                         aria_labels.append(label)
                 except Exception:
                     continue
-            cities = fetch_expanded_city_rows(context, captured_city_queries)
+            try:
+                cities = fetch_expanded_city_rows(context, captured_city_queries)
+            except Exception as city_exc:  # noqa: BLE001
+                # Cloud runners often cannot expand city hierarchy; region+KPI still valid.
+                print(f"[powerbi_scraper] city expand skipped: {city_exc}")
+                cities = []
             refreshed_state = context.storage_state()
             os.environ["POWERBI_AUTH_STATE_CHANGED"] = str(
                 _storage_state_changed(storage_state, refreshed_state)
