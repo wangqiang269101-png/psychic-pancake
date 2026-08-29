@@ -429,8 +429,7 @@ def validate_profit_report(
     if not report["regions"]:
         raise ValueError("未读取到区域利润数据。")
     if config_bool("REQUIRE_CITY_DETAILS") and not report["city_details_available"]:
-        # Cloud runners often cannot expand cities; keep region/KPI push available offline.
-        print("[profit_cloud_push] city details missing; continue without blocking")
+        raise ValueError("城市利润明细缺失：区域→城市下钻未生效，拒绝推送。")
 
     if enforce_date_guard:
         lag_days = (now.date() - report["date"].date()).days

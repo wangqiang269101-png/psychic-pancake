@@ -32,6 +32,11 @@ SKIP_LINES = {
     "Scroll right",
 }
 
+# Power BI matrix native names changed in 2026-08 (权责总利润(万) -> 总利润(万), etc.).
+TOTAL_PROFIT_ALIASES = ("权责总利润(万)", "总利润(万)", "当日总利润")
+DELIVERY_PROFIT_ALIASES = ("权责外卖利润(万)", "外卖利润(万)", "当日外卖利润")
+GROUP_PROFIT_ALIASES = ("团购利润(万)", "当日团购利润", "团购利润")
+
 
 def load_browser_cookies() -> list[dict[str, Any]]:
     try:
@@ -254,12 +259,28 @@ def _projection_index(command: dict[str, Any], native_name: str) -> int | None:
     return None
 
 
+def _projection_index_any(command: dict[str, Any], *native_names: str) -> int | None:
+    for native_name in native_names:
+        index = _projection_index(command, native_name)
+        if index is not None:
+            return index
+    return None
+
+
+def _resolve_matrix_field(value_names: dict[str, str], aliases: tuple[str, ...]) -> str | None:
+    for alias in aliases:
+        if alias in value_names:
+            return value_names[alias]
+    return None
+
+
 def is_city_matrix_query(query_payload: dict[str, Any]) -> bool:
     command = _semantic_command(query_payload)
     if not command:
         return False
-    required = ("区域", "城市", "权责总利润(万)")
-    return all(_projection_index(command, name) is not None for name in required)
+    if _projection_index(command, "区域") is None or _projection_index(command, "城市") is None:
+        return False
+    return _projection_index_any(command, *TOTAL_PROFIT_ALIASES) is not None
 
 
 def expand_city_matrix_query(query_payload: dict[str, Any]) -> dict[str, Any]:
@@ -355,15 +376,19 @@ def parse_city_matrix_rows(
         if native_name and value_name:
             value_names[native_name] = value_name
 
-    required = ("区域", "城市", "权责总利润(万)")
-    if not all(name in value_names for name in required):
+    region_key = value_names.get("区域")
+    city_key = value_names.get("城市")
+    total_key = _resolve_matrix_field(value_names, TOTAL_PROFIT_ALIASES)
+    delivery_key = _resolve_matrix_field(value_names, DELIVERY_PROFIT_ALIASES)
+    group_key = _resolve_matrix_field(value_names, GROUP_PROFIT_ALIASES)
+    if not all((region_key, city_key, total_key)):
         return []
 
     rows: list[dict[str, Any]] = []
     for decoded in _decode_dsr_rows(ds):
-        region = decoded.get(value_names["区域"])
-        city = decoded.get(value_names["城市"])
-        total = decoded.get(value_names["权责总利润(万)"])
+        region = decoded.get(region_key)
+        city = decoded.get(city_key)
+        total = decoded.get(total_key)
         if not region or not city or total is None:
             continue
         try:
@@ -373,8 +398,10 @@ def parse_city_matrix_rows(
         if not math.isfinite(total_number):
             continue
 
-        def optional_number(name: str) -> float | None:
-            value = decoded.get(value_names.get(name, ""))
+        def optional_number(key: str | None) -> float | None:
+            if not key:
+                return None
+            value = decoded.get(key)
             try:
                 return float(value)
             except (TypeError, ValueError):
@@ -386,8 +413,8 @@ def parse_city_matrix_rows(
                 "区域": str(region),
                 "城市": str(city),
                 "当日总利润": total_number,
-                "当日外卖利润": optional_number("权责外卖利润(万)"),
-                "当日团购利润": optional_number("团购利润(万)"),
+                "当日外卖利润": optional_number(delivery_key),
+                "当日团购利润": optional_number(group_key),
             }
         )
     return rows
@@ -498,12 +525,9 @@ def scrape_powerbi_payload(report_url: str) -> list[dict[str, Any]]:
                         aria_labels.append(label)
                 except Exception:
                     continue
-            try:
-                cities = fetch_expanded_city_rows(context, captured_city_queries)
-            except Exception as city_exc:  # noqa: BLE001
-                # Cloud runners often cannot expand city hierarchy; region+KPI still valid.
-                print(f"[powerbi_scraper] city expand skipped: {city_exc}")
-                cities = []
+            cities = fetch_expanded_city_rows(context, captured_city_queries)
+            if not cities:
+                raise ValueError("Power BI 城市矩阵 query 已捕获，但未解析到任何城市明细。")
             refreshed_state = context.storage_state()
             os.environ["POWERBI_AUTH_STATE_CHANGED"] = str(
                 _storage_state_changed(storage_state, refreshed_state)
