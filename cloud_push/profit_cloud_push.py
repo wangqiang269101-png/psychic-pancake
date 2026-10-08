@@ -428,8 +428,20 @@ def validate_profit_report(
         raise ValueError("利润字段存在空值或非数字。")
     if not report["regions"]:
         raise ValueError("未读取到区域利润数据。")
-    if config_bool("REQUIRE_CITY_DETAILS") and not report["city_details_available"]:
-        raise ValueError("城市利润明细缺失：区域→城市下钻未生效，拒绝推送。")
+    if not report["city_details_available"]:
+        # 合盖/云端场景优先保证日利润必达：城市下钻失败时降级推送，不阻断。
+        if config_bool("REQUIRE_CITY_DETAILS"):
+            print(
+                json.dumps(
+                    {
+                        "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                        "event": "warn",
+                        "warning": "城市利润明细缺失，已降级为区域/公司口径推送",
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
 
     if enforce_date_guard:
         lag_days = (now.date() - report["date"].date()).days
