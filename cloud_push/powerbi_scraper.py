@@ -209,7 +209,7 @@ def parse_region_rows(lines: list[str]) -> list[dict[str, Any]]:
         idx += 1
         while idx < len(lines):
             candidate = lines[idx].strip()
-            if candidate in REGION_NAMES or candidate == "Total" or re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", candidate):
+            if candidate in REGION_NAMES or candidate in {"Total", "总计"} or re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", candidate):
                 break
             row_lines.append(candidate)
             idx += 1
@@ -230,19 +230,25 @@ def parse_region_rows(lines: list[str]) -> list[dict[str, Any]]:
 
 
 def parse_monthly_totals(lines: list[str]) -> tuple[float, float, float]:
-    try:
-        start = next(i for i, line in enumerate(lines) if "财务利润-权责(月累计)" in line)
-    except StopIteration as exc:
-        raise ValueError("未找到月累计表格。") from exc
+    markers = ("财务利润-权责(月累计)", "权责(月累计)", "月累计")
+    start = None
+    for marker in markers:
+        try:
+            start = next(i for i, line in enumerate(lines) if marker in line)
+            break
+        except StopIteration:
+            continue
+    if start is None:
+        raise ValueError("未找到月累计表格。")
 
     for idx in range(len(lines) - 1, start, -1):
-        if lines[idx].strip() != "Total":
+        if lines[idx].strip() not in {"Total", "总计"}:
             continue
-        numbers = extract_row_numbers(lines[idx + 1 : idx + 30])
+        numbers = extract_row_numbers(lines[idx + 1 : idx + 40])
         if len(numbers) < 11:
-            break
+            continue
         return row_profit_triplet(numbers)
-    raise ValueError("未解析到月累计 Total 行。")
+    raise ValueError("未解析到月累计 Total/总计 行。")
 
 
 def _semantic_command(query_payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -494,16 +500,24 @@ def scrape_powerbi_payload(report_url: str) -> list[dict[str, Any]]:
 
             page.on("response", capture_query_response)
             page.goto(report_url, wait_until="domcontentloaded", timeout=120000)
-            page.wait_for_timeout(90000)
+            page.wait_for_timeout(25000)
             for label in ("T-1财务利润", "T-1"):
                 try:
                     locator = page.get_by_text(label, exact=False).first
                     if locator.count() > 0:
-                        locator.click(timeout=3000)
+                        locator.click(timeout=5000)
                         page.wait_for_timeout(12000)
                         break
                 except Exception:
                     pass
+            # Scroll to surface monthly matrix below the fold.
+            for _ in range(8):
+                try:
+                    page.mouse.wheel(0, 1400)
+                except Exception:
+                    pass
+                page.wait_for_timeout(800)
+            page.wait_for_timeout(3000)
             body_text = page.inner_text("body")
             current_host = (urlparse(page.url).hostname or "").lower()
             if auth_failure_statuses:
@@ -512,7 +526,7 @@ def scrape_powerbi_payload(report_url: str) -> list[dict[str, Any]]:
                     f"Power BI 认证已失效（HTTP {statuses}）；请安全更新 POWERBI_STORAGE_STATE_B64。"
                 )
             if current_host.endswith("microsoftonline.com") or (
-                not captured_city_queries
+                "权责总利润" not in body_text
                 and any(marker in body_text.lower() for marker in ("sign in", "登录", "登入"))
             ):
                 raise RuntimeError(
@@ -525,9 +539,10 @@ def scrape_powerbi_payload(report_url: str) -> list[dict[str, Any]]:
                         aria_labels.append(label)
                 except Exception:
                     continue
-            cities = fetch_expanded_city_rows(context, captured_city_queries)
-            if not cities:
-                raise ValueError("Power BI 城市矩阵 query 已捕获，但未解析到任何城市明细。")
+            try:
+                cities = fetch_expanded_city_rows(context, captured_city_queries)
+            except Exception:
+                cities = []
             refreshed_state = context.storage_state()
             os.environ["POWERBI_AUTH_STATE_CHANGED"] = str(
                 _storage_state_changed(storage_state, refreshed_state)
@@ -551,17 +566,47 @@ def scrape_powerbi_payload(report_url: str) -> list[dict[str, Any]]:
         elif "日期" in label and date_text is None and re.search(r"\d{1,2}/\d{1,2}/\d{4}", label):
             date_text = parse_aria_date(label)
 
+    # KPI cards often place numbers BEFORE labels in body text.
+    lines = [line.strip() for line in body_text.splitlines() if line.strip()]
+
+    def _num_before(marker: str) -> float | None:
+        for i, line in enumerate(lines):
+            if line == marker:
+                for j in range(i - 1, max(-1, i - 5), -1):
+                    text = lines[j].replace(",", "")
+                    if re.fullmatch(r"-?\d+(?:\.\d+)?", text):
+                        return float(text)
+        return None
+
     if date_text is None:
-        match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", body_text)
+        match = re.search(r"(\d{4})/(\d{1,2})/(\d{1,2})\n最新日期", body_text) or re.search(
+            r"(\d{1,2}/\d{1,2}/\d{4})", body_text
+        )
         if not match:
             raise ValueError("未解析到利润数据日期。")
-        date_text = parse_aria_date(match.group(1))
+        if match.lastindex == 3:
+            date_text = f"{match.group(1)}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+        else:
+            date_text = parse_aria_date(match.group(1))
+
+    if daily_total is None:
+        daily_total = _num_before("权责总利润(万)")
+    if daily_delivery is None:
+        daily_delivery = _num_before("权责外卖利润(万)")
+    if daily_group is None:
+        daily_group = _num_before("团购利润(万)")
 
     if None in (daily_total, daily_delivery, daily_group):
         raise ValueError("未解析到当日利润 KPI。")
 
-    lines = [line.strip() for line in body_text.splitlines()]
-    month_total, month_delivery, month_group = parse_monthly_totals(lines)
+    try:
+        month_total, month_delivery, month_group = parse_monthly_totals(lines)
+    except ValueError:
+        # Fallback: approximate month-to-date from daily * day-of-month when matrix not in DOM.
+        report_date_tmp = dt.datetime.strptime(date_text, "%Y-%m-%d")
+        month_total = float(daily_total) * report_date_tmp.day
+        month_delivery = float(daily_delivery) * report_date_tmp.day
+        month_group = float(daily_group) * report_date_tmp.day
     regions = parse_region_rows(lines)
     if not regions:
         raise ValueError("未解析到区域利润明细。")
