@@ -331,6 +331,7 @@ def normalize_profit_payload(payload: Any) -> dict:
     regions = []
     city_detail_rows = 0
     loss_cities = []
+    profit_cities = []
     for row in normalized_rows:
         row_type = str(row_value(row, "类型", "数据类型", "层级") or "").strip()
         region_name = row_value(row, "区域", "区域名称", "大区")
@@ -351,20 +352,49 @@ def normalize_profit_payload(payload: Any) -> dict:
         if row_type == "城市" or city_name:
             city_detail_rows += 1
             total = to_number(row_value(row, "当日总利润", "当日权责总利润", "权责总利润(万)", "权责总利润"))
-            if city_name and math.isfinite(total) and total < 0:
-                loss_cities.append(
-                    {
-                        "name": str(city_name),
-                        "region": str(region_name or ""),
-                        "total": total,
-                        "delivery": to_number(
-                            row_value(row, "当日外卖利润", "当日权责外卖利润", "权责外卖利润(万)", "权责外卖利润")
-                        ),
-                        "group": to_number(row_value(row, "当日团购利润", "团购利润(万)", "团购利润")),
-                    }
-                )
+            if city_name and math.isfinite(total):
+                city_entry = {
+                    "name": str(city_name),
+                    "region": str(region_name or ""),
+                    "total": total,
+                    "delivery": to_number(
+                        row_value(row, "当日外卖利润", "当日权责外卖利润", "权责外卖利润(万)", "权责外卖利润")
+                    ),
+                    "group": to_number(row_value(row, "当日团购利润", "团购利润(万)", "团购利润")),
+                }
+                if total < 0:
+                    loss_cities.append(city_entry)
+                else:
+                    profit_cities.append(city_entry)
+
+    # 区域矩阵漏抓新区时，用城市明细回补区域合计（如川藏五区、福建二区）。
+    region_names = {item["name"] for item in regions}
+    city_region_totals: dict[str, dict[str, float]] = {}
+    for city in [*loss_cities, *profit_cities]:
+        region = str(city.get("region") or "").strip()
+        if not region:
+            continue
+        bucket = city_region_totals.setdefault(
+            region, {"total": 0.0, "delivery": 0.0, "group": 0.0}
+        )
+        bucket["total"] += float(city["total"])
+        bucket["delivery"] += float(city.get("delivery") or 0.0)
+        bucket["group"] += float(city.get("group") or 0.0)
+    for region, totals in city_region_totals.items():
+        if region in region_names:
+            continue
+        regions.append(
+            {
+                "name": region,
+                "total": totals["total"],
+                "delivery": totals["delivery"],
+                "group": totals["group"],
+            }
+        )
+
     regions.sort(key=lambda x: x["total"], reverse=True)
     loss_cities.sort(key=lambda x: x["total"])
+    profit_cities.sort(key=lambda x: x["total"], reverse=True)
 
     profit_regions = [item for item in regions if math.isfinite(item["total"]) and item["total"] >= 0]
     loss_regions = sorted(
@@ -404,6 +434,7 @@ def normalize_profit_payload(payload: Any) -> dict:
         "loss_regions": loss_regions,
         "city_details_available": city_detail_rows > 0,
         "loss_cities": loss_cities,
+        "profit_cities": profit_cities,
     }
 
 
@@ -548,6 +579,7 @@ def render_profit_image(report: dict) -> Path:
     profit_rows = report.get("profit_regions") or []
     region_loss_rows = report.get("loss_regions") or []
     loss_rows = report.get("loss_cities") or []
+    profit_city_rows = report.get("profit_cities") or []
 
     width, margin, gap = 1080, 40, 24
     card_width = width - margin * 2
@@ -563,6 +595,7 @@ def render_profit_image(report: dict) -> Path:
         + section_height(profit_rows)
         + gap + section_height(region_loss_rows)
         + gap + section_height(loss_rows)
+        + gap + section_height(profit_city_rows)
         + margin
     )
     image = Image.new("RGB", (width, content_height), "#F3F6FA")
@@ -651,6 +684,7 @@ def render_profit_image(report: dict) -> Path:
     draw_section("盈利区域", profit_rows, "growth")
     draw_section("亏损区域", region_loss_rows, "risk")
     draw_section("亏损城市", loss_rows, "primary", city=True)
+    draw_section("盈利城市", profit_city_rows, "growth", city=True)
 
     out = OUTPUT_DIR / f"profit-report-{report['date_text']}.png"
     image.save(out, format="PNG", optimize=True, compress_level=9)
@@ -664,6 +698,7 @@ def compute_fingerprint(report: dict) -> str:
         "regions": report["regions"],
         "city_details_available": report.get("city_details_available"),
         "loss_cities": report.get("loss_cities"),
+        "profit_cities": report.get("profit_cities"),
     }
     raw = json.dumps(digest_input, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
